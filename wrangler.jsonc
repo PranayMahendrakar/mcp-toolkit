@@ -1,0 +1,27 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // "name" becomes part of your public URL: https://<name>.<your-account>.workers.dev
+  "name": "mcp-toolkit",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-10",
+  "compatibility_flags": ["nodejs_compat"],
+  // McpAgent stores each MCP session in a Durable Object. The free plan supports
+  // SQLite-backed Durable Objects, which is what "new_sqlite_classes" selects.
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["MyMCP"]
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "MCP_OBJECT",
+        "class_name": "MyMCP"
+      }
+    ]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
