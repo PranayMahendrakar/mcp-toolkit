@@ -1,0 +1,5 @@
+﻿{
+  "name": "mcp-toolkit",
+  "mcpUrl": "https://mcp-toolkit.mahendrakarpranay.workers.dev/mcp",
+  "tools": ["get_current_time", "calculate", "word_count", "test_regex", "diff_text", "estimate_tokens", "validate_data", "decode_jwt"]
+}
