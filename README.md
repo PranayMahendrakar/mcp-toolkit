@@ -8,13 +8,26 @@ and one public URL works everywhere.
 
 ### Tools it adds to the AI
 
+**The theme: things AI is confidently bad at.** Every tool here *computes* rather than guesses.
+
 | Tool | What it does | Why it helps |
 |------|--------------|--------------|
 | `get_current_time` | Real current time in any timezone | LLMs don't actually know "now" |
 | `calculate` | Precise arithmetic (`+ - * / % ^`, parentheses) | LLMs make math mistakes |
 | `word_count` | Exact word / character / sentence stats | LLMs can't reliably count |
+| `test_regex` | **Actually runs** your regex against test strings — real matches, positions, capture groups | LLMs guess regex behaviour and are often wrong |
+| `diff_text` | Exact line-by-line diff with true added/removed counts | LLMs miscount and invent changes when comparing by eye |
+| `estimate_tokens` | Exact char/word counts + an approximate token range, and cost if you supply your rate | Sizing prompts and budgeting spend |
+| `validate_data` | Validates JSON/YAML with a **real parser**, pinpointing the error line and column | LLMs guess at syntax errors |
+| `decode_jwt` | Decodes header + payload, renders `exp`/`iat` as real dates, flags expiry | Inspecting tokens without a website |
 
-All three are **read-only** — they can't change or delete anything.
+All are **read-only** — they can't change or delete anything.
+
+### Honest limits (deliberately stated)
+
+- **`estimate_tokens` is an estimate**, not a BPE tokenizer (~4 chars/token heuristic, typically ±10–20% on English prose; code and non-English text differ). The character and word counts *are* exact. It never hardcodes model prices — you pass your own rate, because prices change.
+- **`decode_jwt` decodes; it does not verify.** Verifying a signature needs the key. Anyone can read a JWT's contents — only the key holder can prove it's authentic. Don't paste live production tokens into any third-party tool, this one included.
+- **`diff_text` caps at 300 lines per side** — the diff is O(n×m) and the free tier allows 10ms CPU per request.
 
 ---
 

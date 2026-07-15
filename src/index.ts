@@ -18,11 +18,15 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { McpAgent } from "agents/mcp";
+import yaml from "js-yaml";
 import { z } from "zod";
 
 interface Env {
   MCP_OBJECT: DurableObjectNamespace;
 }
+
+// Caps keep us inside the free tier's 10ms CPU budget. The diff is O(n*m).
+const MAX_DIFF_LINES = 300;
 
 export class MyMCP extends McpAgent {
   server = new McpServer({
@@ -177,7 +181,229 @@ export class MyMCP extends McpAgent {
         };
       },
     );
+
+    // ---------------------------------------------------------------------
+    // Tool 4: regex — actually executed, not guessed.
+    // ---------------------------------------------------------------------
+    this.server.registerTool(
+      "test_regex",
+      {
+        title: "Test a regex (really runs it)",
+        description:
+          "Compile and ACTUALLY RUN a regular expression against test strings, returning the real matches, positions and capture groups. Models routinely guess regex behaviour wrong — this executes it. Use whenever a regex is written, debugged, or claimed to work.",
+        inputSchema: {
+          pattern: z.string().min(1).max(500).describe("The regex pattern, without delimiters."),
+          tests: z.array(z.string().max(2000)).min(1).max(20).describe("Strings to test the pattern against."),
+          flags: z.string().max(8).optional().describe("Regex flags, e.g. 'gi', 'm'. Default none."),
+        },
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      async ({ pattern, tests, flags }) => {
+        let re: RegExp;
+        try {
+          re = new RegExp(pattern, flags ?? "");
+        } catch (e) {
+          return { isError: true, content: [{ type: "text", text: `Invalid regex: ${e instanceof Error ? e.message : String(e)}` }] };
+        }
+        const groups = (m: RegExpMatchArray) =>
+          m.length > 1 ? ` groups: [${m.slice(1).map((x) => JSON.stringify(x ?? null)).join(", ")}]` : "";
+        const lines = tests.map((t, i) => {
+          try {
+            if (flags?.includes("g")) {
+              const ms = [...t.matchAll(re)];
+              if (ms.length === 0) return `${i + 1}. ✗ no match — ${JSON.stringify(t)}`;
+              return `${i + 1}. ✓ ${ms.length} match(es) — ${JSON.stringify(t)}\n   ${ms.map((m) => `"${m[0]}" @${m.index}${groups(m)}`).join("\n   ")}`;
+            }
+            const m = re.exec(t);
+            if (!m) return `${i + 1}. ✗ no match — ${JSON.stringify(t)}`;
+            return `${i + 1}. ✓ "${m[0]}" @${m.index}${groups(m)} — ${JSON.stringify(t)}`;
+          } catch (e) {
+            return `${i + 1}. ⚠️ error: ${e instanceof Error ? e.message : String(e)}`;
+          }
+        });
+        const hits = lines.filter((l) => l.includes("✓")).length;
+        return { content: [{ type: "text", text: `Regex: /${pattern}/${flags ?? ""}\nMatched ${hits} of ${tests.length} test string(s).\n\n${lines.join("\n")}` }] };
+      },
+    );
+
+    // ---------------------------------------------------------------------
+    // Tool 5: exact diff. Models miscount changes when eyeballing text.
+    // ---------------------------------------------------------------------
+    this.server.registerTool(
+      "diff_text",
+      {
+        title: "Exact text diff",
+        description:
+          "Compute an EXACT line-by-line diff between two texts, with true added/removed counts. Models miscount and invent changes when comparing by eye — this computes it. Use to compare two versions of text, config, or code.",
+        inputSchema: {
+          a: z.string().describe("Original text."),
+          b: z.string().describe("Changed text."),
+        },
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      async ({ a, b }) => {
+        const la = a.split(/\r?\n/);
+        const lb = b.split(/\r?\n/);
+        if (la.length > MAX_DIFF_LINES || lb.length > MAX_DIFF_LINES) {
+          return {
+            isError: true,
+            content: [{ type: "text", text: `Too large: ${la.length} vs ${lb.length} lines (limit ${MAX_DIFF_LINES} each, to stay inside the free CPU budget). Diff a smaller section.` }],
+          };
+        }
+        const d = diffLines(la, lb);
+        const added = d.filter((x) => x.t === "+").length;
+        const removed = d.filter((x) => x.t === "-").length;
+        if (added === 0 && removed === 0) {
+          return { content: [{ type: "text", text: "Identical — no differences." }] };
+        }
+        const body = d.map((x) => `${x.t} ${x.line}`).join("\n");
+        return { content: [{ type: "text", text: `+${added} added  -${removed} removed  (${d.filter((x) => x.t === " ").length} unchanged)\n\n${body}` }] };
+      },
+    );
+
+    // ---------------------------------------------------------------------
+    // Tool 6: token/cost estimate. Honest: exact counts + a LABELLED estimate.
+    // ---------------------------------------------------------------------
+    this.server.registerTool(
+      "estimate_tokens",
+      {
+        title: "Estimate tokens & cost",
+        description:
+          "Estimate how many tokens a piece of text is, and optionally what it costs. Returns EXACT character and word counts plus an approximate token range. Use when sizing a prompt against a context window or budgeting API spend.",
+        inputSchema: {
+          text: z.string().min(1).describe("The text to size."),
+          usd_per_million_tokens: z.number().positive().optional().describe("Your model's price per 1M tokens, to compute cost. Supply it yourself — prices change and this tool does not guess them."),
+        },
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      async ({ text, usd_per_million_tokens }) => {
+        const chars = [...text].length;
+        const words = (text.match(/\S+/g) ?? []).length;
+        const byChars = Math.round(chars / 4);
+        const byWords = Math.round(words / 0.75);
+        const lo = Math.min(byChars, byWords);
+        const hi = Math.max(byChars, byWords);
+        const mid = Math.round((lo + hi) / 2);
+        const cost =
+          usd_per_million_tokens !== undefined
+            ? `\nEstimated cost: $${((mid / 1_000_000) * usd_per_million_tokens).toFixed(6)} (range $${((lo / 1_000_000) * usd_per_million_tokens).toFixed(6)}–$${((hi / 1_000_000) * usd_per_million_tokens).toFixed(6)}) at $${usd_per_million_tokens}/1M tokens`
+            : `\nCost: pass usd_per_million_tokens to compute it (this tool does not hardcode prices, which change).`;
+        return {
+          content: [{
+            type: "text",
+            text:
+              `EXACT counts:\n• Characters: ${chars}\n• Words: ${words}\n\n` +
+              `APPROXIMATE tokens: ~${mid} (range ${lo}–${hi})${cost}\n\n` +
+              `Note: this is a heuristic (~4 chars/token, ~0.75 words/token), typically within ~10–20% for English prose. It is NOT a real BPE tokenizer — code, non-English text, and unusual symbols tokenize differently. For exact counts use the provider's tokenizer/count-tokens endpoint.`,
+          }],
+        };
+      },
+    );
+
+    // ---------------------------------------------------------------------
+    // Tool 7: JSON/YAML validation with a real parser and a real error position.
+    // ---------------------------------------------------------------------
+    this.server.registerTool(
+      "validate_data",
+      {
+        title: "Validate JSON / YAML",
+        description:
+          "Validate JSON or YAML with a real parser and report the exact error and its location. Models guess at syntax errors; this parses. Use whenever JSON/YAML is written or someone reports a config/parse error.",
+        inputSchema: {
+          text: z.string().min(1).describe("The JSON or YAML text."),
+          format: z.enum(["json", "yaml", "auto"]).optional().describe("Default auto — detects from the content."),
+        },
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      async ({ text, format }) => {
+        const t = text.trim();
+        const fmt = !format || format === "auto" ? (t.startsWith("{") || t.startsWith("[") ? "json" : "yaml") : format;
+        try {
+          if (fmt === "json") {
+            const v = JSON.parse(t);
+            return { content: [{ type: "text", text: `✅ Valid JSON.\nTop-level type: ${Array.isArray(v) ? `array (${v.length} items)` : typeof v === "object" && v !== null ? `object (${Object.keys(v).length} keys: ${Object.keys(v).slice(0, 10).join(", ")})` : typeof v}` }] };
+          }
+          const v = yaml.load(t);
+          return { content: [{ type: "text", text: `✅ Valid YAML.\nTop-level type: ${Array.isArray(v) ? `array (${v.length} items)` : typeof v === "object" && v !== null ? `object (${Object.keys(v as object).length} keys: ${Object.keys(v as object).slice(0, 10).join(", ")})` : typeof v}` }] };
+          } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return { isError: true, content: [{ type: "text", text: `❌ Invalid ${fmt.toUpperCase()}.\n\n${msg}` }] };
+        }
+      },
+    );
+
+    // ---------------------------------------------------------------------
+    // Tool 8: JWT decode. Decoding is NOT verifying — the tool says so.
+    // ---------------------------------------------------------------------
+    this.server.registerTool(
+      "decode_jwt",
+      {
+        title: "Decode a JWT",
+        description:
+          "Decode a JWT's header and payload and render its claims, including expiry as a real date. Does NOT verify the signature (that needs the secret/public key) — the output says so explicitly. Use to inspect a token's contents or check whether it has expired.",
+        inputSchema: { token: z.string().min(10).describe("The JWT (three dot-separated base64url parts).") },
+        annotations: { readOnlyHint: true, openWorldHint: false },
+      },
+      async ({ token }) => {
+        const parts = token.trim().split(".");
+        if (parts.length < 2) {
+          return { isError: true, content: [{ type: "text", text: "Not a JWT: expected at least two dot-separated base64url parts (header.payload[.signature])." }] };
+        }
+        try {
+          const header = JSON.parse(b64urlDecode(parts[0]));
+          const payload = JSON.parse(b64urlDecode(parts[1])) as Record<string, unknown>;
+          const when = (k: string) => {
+            const v = payload[k];
+            return typeof v === "number" ? `\n• ${k}: ${v} → ${new Date(v * 1000).toISOString()}` : "";
+          };
+          const exp = typeof payload.exp === "number" ? payload.exp * 1000 : null;
+          const state = exp === null ? "no exp claim — does not expire" : exp < Date.now() ? `EXPIRED ${Math.round((Date.now() - exp) / 60000)} min ago` : `valid for another ${Math.round((exp - Date.now()) / 60000)} min`;
+          return {
+            content: [{
+              type: "text",
+              text:
+                `Header:\n${JSON.stringify(header, null, 2)}\n\nPayload:\n${JSON.stringify(payload, null, 2)}\n\n` +
+                `Timing: ${state}${when("iat")}${when("nbf")}${when("exp")}\n\n` +
+                `⚠️ Signature NOT verified — decoding only. Anyone can read a JWT's contents; only the key holder can prove it's authentic. Treat these claims as unverified until the signature is checked server-side.\n` +
+                `⚠️ A JWT is a credential. Avoid pasting live production tokens into any third-party tool, including this one.`,
+            }],
+          };
+        } catch (e) {
+          return { isError: true, content: [{ type: "text", text: `Could not decode: ${e instanceof Error ? e.message : String(e)}` }] };
+        }
+      },
+    );
   }
+}
+
+/** Base64url -> UTF-8 string. */
+function b64urlDecode(s: string): string {
+  const pad = s.length % 4 === 0 ? "" : "=".repeat(4 - (s.length % 4));
+  const bin = atob(s.replace(/-/g, "+").replace(/_/g, "/") + pad);
+  return new TextDecoder().decode(Uint8Array.from(bin, (c) => c.charCodeAt(0)));
+}
+
+/** Classic LCS line diff. O(n*m) — callers must cap input size. */
+function diffLines(a: string[], b: string[]): Array<{ t: "+" | "-" | " "; line: string }> {
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = m - 1; i >= 0; i--) {
+    for (let j = n - 1; j >= 0; j--) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const out: Array<{ t: "+" | "-" | " "; line: string }> = [];
+  let i = 0;
+  let j = 0;
+  while (i < m && j < n) {
+    if (a[i] === b[j]) out.push({ t: " ", line: a[i++] }), j++;
+    else if (dp[i + 1][j] >= dp[i][j + 1]) out.push({ t: "-", line: a[i++] });
+    else out.push({ t: "+", line: b[j++] });
+  }
+  while (i < m) out.push({ t: "-", line: a[i++] });
+  while (j < n) out.push({ t: "+", line: b[j++] });
+  return out;
 }
 
 /**
